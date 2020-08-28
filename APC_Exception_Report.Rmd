@@ -1,0 +1,220 @@
+---
+title: "APC Exception Report"
+author: "Samuel B. Carter"
+date: '`r format(Sys.Date(), "%B %d, %Y")`'
+knit: (function(inputFile, encoding) { rmarkdown::render(inputFile, encoding = encoding, output_file = paste0(format(Sys.Date(), "%Y%m%d"), " APC Exception Report",'.html')) })
+output:
+  html_document:
+    df_print: paged
+    fig_cap: true
+    code_folding: hide
+    
+---
+
+Vehicles are identified for inspection by CVT when they meet one of two criteria on any given day:
+
+1) Vehicle recorded fewer than ten boardings or alightings; or
+2) Difference between vehiclular boardings and alightings was greater than twenty-five percent
+
+```{r setup}
+knitr::opts_chunk$set(warning=FALSE) # remove code chunks with echo = FALSE
+
+# revision history
+
+# 4/16/20 - added pre-trip / diagnostic failures
+
+```
+
+```{r define date variables}
+
+# set dynamic date variables 
+
+last_week_start_Avail <- lubridate::floor_date(Sys.Date() -7, unit = "week")
+
+last_week_end_Avail <- lubridate::ceiling_date(Sys.Date() - 7, unit = "week") - 1
+```
+
+This report covers service from `r last_week_start_Avail` though `r last_week_end_Avail`.
+
+
+```{r set libraries, include=FALSE, results='hide'}
+
+library(tidyverse)
+library(kableExtra)
+
+```
+
+```{r get and clean APC data, results='asis'}
+# gather, clean, transform data
+
+con <- DBI::dbConnect(odbc::odbc(), Driver = "SQL Server", Server = "REPSQLP01VW", 
+                      Database = "Steve_Temp", Port = 1433)
+ 
+last_week_end_Avail_query <- last_week_end_Avail + 2
+
+Apc_Data_raw <- tbl(con, "Apc_Data") %>%
+  filter(GPS_Time >= last_week_start_Avail,
+         GPS_Time <= last_week_end_Avail_query) %>%
+  collect()
+
+# get transit day (for Sunday service, does not run past midnight, so this may not
+# change much here)
+
+Apc_Data_raw$Date <- as.Date(str_sub(Apc_Data_raw$GPS_Time, 1, 10))
+
+Apc_Data_raw$Clock_Time <- str_sub(Apc_Data_raw$GPS_Time, 12, 19)
+
+Apc_Data_raw$DateTest <- ifelse(Apc_Data_raw$Clock_Time < 
+                                        "03:00:00", 1, 0)
+
+# now change Transit Day based on DateTest
+
+Apc_Data_raw$Transit_Day_Unix <- ifelse(Apc_Data_raw$DateTest == 1,
+                                              lubridate::as_date(Apc_Data_raw$Date - 1),
+                                              Apc_Data_raw$Date)
+
+# add two dates together
+
+Apc_Data_raw$Epoch_Date <- as.Date("1970-01-01")
+
+Apc_Data_raw$Transit_Day <- Apc_Data_raw$Epoch_Date + lubridate::days(Apc_Data_raw$Transit_Day_Unix)
+
+# filter out previous week's data (due to GPS_Time conversion)
+
+Apc_Data_raw <- Apc_Data_raw %>%
+  filter(between(Transit_Day, last_week_start_Avail, last_week_end_Avail))
+
+```
+
+```{r get and clean diagnostic data, results='asis'}
+# gather, clean, transform data
+
+con2 <- DBI::dbConnect(odbc::odbc(), Driver = "SQL Server", Server = "AVAILDWHP01VW",
+                       Database = "DW_IndyGo", Port = 1433)
+
+DimEventType <- tbl(con2, "DimEventType") %>% collect()
+
+# looking for EventTypeKey %in% c(1075:1078)
+
+# let's get last week's events with those event dates
+
+last_week_start_Avail <- lubridate::floor_date(Sys.Date() -7, unit = "week")
+
+last_week_end_Avail <- lubridate::ceiling_date(Sys.Date() - 7, unit = "week") - 1
+
+DimDate_last_week <- tbl(con2, "DimDate") %>%
+  filter(between(CalendarDate, last_week_start_Avail, last_week_end_Avail)) %>%
+  collect()
+
+FactEvent_APC_last_week <- tbl(con2, "FactEvent") %>%
+  filter(DateKey %in% !!DimDate_last_week$DateKey,
+         EventTypeKey %in% c(1075:1078)) %>%
+  collect()
+
+# from here, let's pull out Date.. EventTypeKey...VehicleKey, OperatorUserKey, EventDateTime
+
+DimVehicle <- tbl(con2, "DimVehicle") %>% collect()
+DimUser <- tbl(con2, "DimUser") %>% collect()
+
+```
+
+```{r transform data part 1, results='asis' }
+# let's pull out zero or small boarding vehicles
+
+Apc_Data_raw %>%
+  group_by(MDCID, Transit_Day) %>%
+  summarise(APC_Boardings = sum(Boarding),
+            APC_Alightings = sum(Alighting)) %>%
+  filter(APC_Boardings < 10 | APC_Alightings < 10)  %>%
+  select(Date = Transit_Day, Vehicle = MDCID, Boardings = APC_Boardings, Alightings = APC_Alightings) %>%
+  arrange(Vehicle, Date) %>%
+  kable(., format = "html", caption = "Vehicle recorded fewer than ten boardings or alightings") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),  full_width = F)
+```
+
+```{r transform data part 2, results='asis' }
+
+Apc_Data_raw %>%
+  group_by(MDCID, Transit_Day) %>%
+  summarise(APC_Boardings = sum(Boarding),
+            APC_Alightings = sum(Alighting),
+            APC_Percent_Difference = (1 - sum(Boarding)/ sum(Alighting))) %>%
+  filter(APC_Boardings > 10 & APC_Alightings > 10 & (abs(APC_Boardings - APC_Alightings) > (APC_Boardings * .25)) |
+           APC_Boardings > 10 & APC_Alightings > 10 & (abs(APC_Boardings - APC_Alightings) > (APC_Alightings * .25)))  %>%
+  select(Date = Transit_Day, Vehicle = MDCID, Boardings = APC_Boardings, Alightings = APC_Alightings,
+         Difference = APC_Percent_Difference) %>%
+  arrange(Vehicle, Date) %>%
+  mutate(Difference = scales::percent(Difference, accuracy = 1)) %>%
+  kable(., format = "html", caption = "Difference between vehiclular boardings and alightings was greater than twenty-five percent") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),  full_width = F)
+  
+```
+ 
+## Highest priority vehicles
+
+Red Line vehicles have highest priority. These are the Red Line vehicles excepted in this week's report:
+
+```{r summarise Red Line vehicle counts, results='asis' }
+
+Apc_Data_raw %>%
+  group_by(MDCID, Transit_Day) %>%
+  summarise(APC_Boardings = sum(Boarding),
+            APC_Alightings = sum(Alighting),
+            APC_Percent_Difference = (1 - sum(Boarding)/ sum(Alighting))) %>%
+  filter(APC_Boardings < 10 | APC_Alightings < 10 | APC_Boardings > 10 & APC_Alightings > 10 & (abs(APC_Boardings - APC_Alightings) > (APC_Boardings * .25)) |
+           APC_Boardings > 10 & APC_Alightings > 10 & (abs(APC_Boardings - APC_Alightings) > (APC_Alightings * .25)))  %>%
+  select(Date = Transit_Day, Vehicle = MDCID, Boardings = APC_Boardings, Alightings = APC_Alightings,
+         Difference = APC_Percent_Difference) %>%
+  filter(between(Vehicle, 1950, 1999) | Vehicle == 1899) %>%
+  group_by(Vehicle) %>%
+  tally()%>%
+  select(Vehicle, Times_in_Report = n) %>%
+  arrange(desc(Times_in_Report), Vehicle) %>%
+  kable(., format = "html", caption = "Red Line Vehicles in Exception Report") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),  full_width = F)
+  
+```
+
+After Red Line vehicles, these are the number of times each vehicle appeared in this week's exception report:
+
+```{r summarise Fixed-Route vehicle counts, results='asis' }
+
+Apc_Data_raw %>%
+  group_by(MDCID, Transit_Day) %>%
+  summarise(APC_Boardings = sum(Boarding),
+            APC_Alightings = sum(Alighting),
+            APC_Percent_Difference = (1 - sum(Boarding)/ sum(Alighting))) %>%
+  filter(APC_Boardings < 10 | APC_Alightings < 10 | APC_Boardings > 10 & APC_Alightings > 10 & (abs(APC_Boardings - APC_Alightings) > (APC_Boardings * .25)) |
+           APC_Boardings > 10 & APC_Alightings > 10 & (abs(APC_Boardings - APC_Alightings) > (APC_Alightings * .25)))  %>%
+  select(Date = Transit_Day, Vehicle = MDCID, Boardings = APC_Boardings, Alightings = APC_Alightings,
+         Difference = APC_Percent_Difference) %>%
+  filter(!between(Vehicle, 1950, 1999), Vehicle != 1899) %>%
+  group_by(Vehicle) %>%
+  tally()%>%
+  select(Vehicle, Times_in_Report = n) %>%
+  arrange(desc(Times_in_Report), Vehicle) %>%
+  kable(., format = "html", caption = "Fixed-Route Vehicles in Exception Report") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),  full_width = F)
+  
+```
+
+The following vehicles failed pre-trip or automatic diagnostics last week:
+
+```{r pre-trip APC diagnostic failures, results='asis' }
+
+FactEvent_APC_last_week %>%
+  filter(EventTypeKey %in% c(1075, 1076)) %>%
+  left_join(select(DimVehicle, VehicleKey, Vehicle_No = VehicleFareboxID), by = "VehicleKey") %>%
+  left_join(select(DimUser, UserKey, LogonID, LastName, FirstName), 
+            by = c("OperatorUserKey" = "UserKey")) %>%
+  left_join(DimEventType, by = "EventTypeKey") %>%
+  left_join(DimDate_last_week, by = "DateKey") %>%
+  select(CalendarDate, EventDateTime, Vehicle_No, LogonID, EventLongName,EventDesc) %>%
+  group_by(Vehicle_No, EventLongName, EventDesc) %>%
+  summarise(Times_Failed =n()) %>%
+  arrange(desc(Times_Failed, Vehicle_No)) %>%
+  kable(., format = "html", caption = "APC diagnostic or pre-trip failures") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),  full_width = F)
+  
+```
+If you believe this report is in error, please contact Samuel Carter (scarter@indygo.net) or Steve Kraynik (skranik@indygo.net). Report last revised 4-16-20.
