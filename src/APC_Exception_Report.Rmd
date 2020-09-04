@@ -1,6 +1,6 @@
 ---
 title: "APC Exception Report"
-author: "Samuel B. Carter"
+author: "Mike Nugent, Jr."
 date: '`r format(Sys.Date(), "%B %d, %Y")`'
 knit: (function(inputFile, encoding) { rmarkdown::render(inputFile, encoding = encoding, output_file = paste0(format(Sys.Date(), "%Y%m%d"), " APC Exception Report",'.html')) })
 output:
